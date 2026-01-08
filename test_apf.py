@@ -20,7 +20,7 @@ from utils.visualization import Visualizer
 def main():
     # 설정 생성
     robot_config = RobotConfig()
-    env_config = EnvConfig(num_agents=25)
+    env_config = EnvConfig(num_agents=4)
 
     # 환경 및 시각화 생성
     env = MultiAgentEnv(env_config, robot_config)

@@ -14,7 +14,11 @@ from typing import Tuple
 
 def bounded_activation(x: Tensor, low: float, high: float) -> Tensor:
     """
-    Sigmoid 기반 bounded 출력 활성화.
+    Atan 기반 bounded 출력 활성화.
+
+    Sigmoid 대비 장점: 극값에서도 gradient가 유지됨
+    - sigmoid gradient at x=10: ~0.00005
+    - atan gradient at x=10: ~0.01 (200배 큼)
 
     Args:
         x: 입력
@@ -24,14 +28,17 @@ def bounded_activation(x: Tensor, low: float, high: float) -> Tensor:
     Returns:
         [low, high] 범위의 출력
     """
-    return low + (high - low) * torch.sigmoid(x)
+    # atan(x)/π + 0.5 → [0, 1] 범위로 매핑
+    import math
+    normalized = torch.atan(x) / math.pi + 0.5
+    return low + (high - low) * normalized
 
 
 class NodeHead(nn.Module):
     """
     노드 레벨 스칼라 출력: k_g, d
 
-    k_g: 목표 스프링 상수 [0.1, 10.0]
+    k_g: 목표 인력 크기 [0.1, 15.0]
     d: 감쇠 계수 [0.1, 5.0]
     """
 
@@ -78,7 +85,7 @@ class NodeHead(nn.Module):
         """
         features = self.mlp(node_embedding)
 
-        k_g = bounded_activation(self.k_g_head(features).squeeze(-1), 0.1, 10.0)
+        k_g = bounded_activation(self.k_g_head(features).squeeze(-1), 0.1, 15.0)
         d = bounded_activation(self.d_head(features).squeeze(-1), 0.1, 5.0)
 
         return k_g, d
@@ -88,7 +95,7 @@ class EdgeHead(nn.Module):
     """
     에이전트-에이전트 엣지 스칼라 출력: k, d, c
 
-    k: 에이전트 간 스프링 상수 [0.1, 10.0]
+    k: 에이전트 간 스프링 상수 [0.01, 3.0] (k/r 공식에서 필요시 강한 척력 가능)
     d: 에이전트 간 감쇠 계수 [0.1, 5.0]
     c: 커플링 계수 [-2.0, 2.0]
     """
@@ -157,7 +164,7 @@ class EdgeHead(nn.Module):
         combined = torch.cat([src_emb, dst_emb, edge_attr], dim=-1)
         features = self.mlp(combined)
 
-        k = bounded_activation(self.k_head(features).squeeze(-1), 0.1, 10.0)
+        k = bounded_activation(self.k_head(features).squeeze(-1), 0.01, 3.0)
         d = bounded_activation(self.d_head(features).squeeze(-1), 0.1, 5.0)
         c = bounded_activation(self.c_head(features).squeeze(-1), -2.0, 2.0)
 
@@ -170,7 +177,7 @@ class ObstacleEdgeHead(nn.Module):
 
     현재 시뮬레이터에서는 장애물 없음. 추후 확장용.
 
-    k_obs: 장애물 반발 스프링 상수 [0.1, 10.0]
+    k_obs: 장애물 반발 스프링 상수 [0.01, 3.0]
     """
 
     def __init__(
@@ -225,11 +232,11 @@ class ObstacleEdgeHead(nn.Module):
             edge_attr: 엣지 features (E, edge_dim)
 
         Returns:
-            k_obs: 장애물 반발 스프링 상수 (E,), [0.1, 10.0]
+            k_obs: 장애물 반발 스프링 상수 (E,), [0.01, 0.5]
         """
         combined = torch.cat([src_emb, dst_emb, edge_attr], dim=-1)
         features = self.mlp(combined)
 
-        k_obs = bounded_activation(self.k_obs_head(features).squeeze(-1), 0.1, 10.0)
+        k_obs = bounded_activation(self.k_obs_head(features).squeeze(-1), 0.01, 3.0)
 
         return k_obs

@@ -17,10 +17,10 @@ if TYPE_CHECKING:
     from ..core.dynamics import AgentState
 
 try:
-    from ..config import RobotConfig, GATConfig
+    from ..config import RobotConfig, GATConfig, EnvConfig
     from ..networks import GATBackbone, NodeHead, EdgeHead
 except ImportError:
-    from config import RobotConfig, GATConfig
+    from config import RobotConfig, GATConfig, EnvConfig
     from networks import GATBackbone, NodeHead, EdgeHead
 
 
@@ -38,7 +38,8 @@ class LightPHController(BaseController):
         node_head: NodeHead,
         edge_head: EdgeHead,
         robot_config: RobotConfig,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        env_config: EnvConfig = None
     ):
         """
         Args:
@@ -47,12 +48,15 @@ class LightPHController(BaseController):
             edge_head: 엣지 스칼라 출력 헤드
             robot_config: 로봇 파라미터
             device: 디바이스
+            env_config: 환경 설정 (벽 경계 정보)
         """
         self.gat_backbone = gat_backbone
         self.node_head = node_head
         self.edge_head = edge_head
         self.robot_config = robot_config
         self.device = device
+        self.env_config = env_config
+        self.use_walls = env_config is not None
 
         # 모델을 디바이스로 이동
         self.gat_backbone.to(device)
@@ -63,7 +67,8 @@ class LightPHController(BaseController):
         self,
         state: 'AgentState',
         goal: np.ndarray,
-        neighbors: List['AgentState']
+        neighbors: List['AgentState'],
+        obstacles: List[np.ndarray] = None
     ) -> np.ndarray:
         """
         Light-pH 제어 입력 계산.
@@ -72,13 +77,25 @@ class LightPHController(BaseController):
             state: 현재 상태
             goal: 목표 위치
             neighbors: 이웃들
+            obstacles: 장애물 위치 리스트 [(x, y), ...] - None이면 벽만 사용
 
         Returns:
             힘 [Fx, Fy]
         """
+        # 장애물 통합: 벽 + 외부 장애물
+        all_obstacles = []
+        if self.use_walls:
+            wall_positions = self._get_wall_positions(state.position)
+            all_obstacles.extend(wall_positions)
+        if obstacles is not None:
+            all_obstacles.extend([np.asarray(o) for o in obstacles])
+
         # 1. 그래프 구성
-        graph_data = self._build_graph(state, goal, neighbors)
+        graph_data = self._build_graph(state, goal, neighbors, all_obstacles)
         graph_data = graph_data.to(self.device)
+
+        num_neighbors = graph_data.num_neighbors
+        num_obstacles = graph_data.num_obstacles
 
         # 2. GAT forward → node embeddings
         with torch.no_grad():
@@ -108,18 +125,32 @@ class LightPHController(BaseController):
                 dst_emb = node_embeddings[dst_indices]
                 edge_feat = edge_attr[src_mask]
 
-                k_ij, d_ij, c_ij = self.edge_head(src_emb, dst_emb, edge_feat)
-                k_ij = k_ij.cpu().numpy()
-                d_ij = d_ij.cpu().numpy()
-                c_ij = c_ij.cpu().numpy()
+                k_all, d_all, c_all = self.edge_head(src_emb, dst_emb, edge_feat)
+                k_all = k_all.cpu().numpy()
+                d_all = d_all.cpu().numpy()
+                c_all = c_all.cpu().numpy()
+
+                # 이웃 엣지와 장애물 엣지 분리
+                # ego 에서 나가는 엣지 순서: neighbors (num_neighbors) -> obstacles (num_obstacles)
+                k_ij = k_all[:num_neighbors]
+                d_ij = d_all[:num_neighbors]
+                c_ij = c_all[:num_neighbors]
+
+                if num_obstacles > 0:
+                    k_io = k_all[num_neighbors:num_neighbors + num_obstacles]
+                else:
+                    k_io = np.array([])
             else:
                 k_ij = np.array([])
                 d_ij = np.array([])
                 c_ij = np.array([])
+                k_io = np.array([])
 
         # 4. Analytic ∇H 계산
         grad_H = self._compute_hamiltonian_gradient(
-            state, goal, neighbors, k_ij, k_g_self
+            state, goal, neighbors, k_ij, k_g_self,
+            obstacle_positions=all_obstacles if len(all_obstacles) > 0 else None,
+            k_io=k_io if len(k_io) > 0 else None
         )
 
         # 5. Port-Hamiltonian control law: u = (J - R) ∇H
@@ -143,7 +174,8 @@ class LightPHController(BaseController):
         self,
         state: 'AgentState',
         goal: np.ndarray,
-        neighbors: List['AgentState']
+        neighbors: List['AgentState'],
+        obstacles: List[np.ndarray] = None
     ) -> Data:
         """
         torch_geometric용 그래프 데이터 생성.
@@ -152,11 +184,15 @@ class LightPHController(BaseController):
             state: 자기 상태
             goal: 목표 위치
             neighbors: 이웃들
+            obstacles: 장애물 위치 리스트 [(x, y), ...]
 
         Returns:
             torch_geometric.data.Data: 그래프 데이터
         """
-        num_nodes = 1 + len(neighbors)  # 자기 + 이웃들
+        num_neighbors = len(neighbors)
+        obstacles = obstacles if obstacles is not None else []
+        num_obstacles = len(obstacles)
+        num_nodes = 1 + num_neighbors + num_obstacles  # 자기 + 이웃들 + 장애물들
 
         # Node features: [type(3), state(4), mission(3), goal_offset(2)] = 12
         node_features = []
@@ -181,36 +217,66 @@ class LightPHController(BaseController):
             ])
             node_features.append(neighbor_node)
 
+        # 장애물 노드들 (obstacle type)
+        for obs_pos in obstacles:
+            obs_type = np.array([0, 0, 1])  # obstacle
+            obs_state = np.concatenate([obs_pos, np.zeros(2)])  # 위치 + 속도 0
+            obs_mission = np.array([0, 0, 0])  # 해당 없음
+            obs_goal_offset = np.array([0, 0])  # 해당 없음
+            obs_node = np.concatenate([
+                obs_type, obs_state, obs_mission, obs_goal_offset
+            ])
+            node_features.append(obs_node)
+
         x = torch.tensor(np.array(node_features), dtype=torch.float32)
 
         # Edge features: [Δq(2), Δv(2), r(1), q̂(2)] = 7
-        # Fully connected (self-loop 제외)
         edge_index = []
         edge_attr = []
 
-        all_states = [state] + neighbors
+        # 에이전트들 (자기 + 이웃들) - fully connected
+        all_agent_states = [state] + neighbors
+        num_agents = 1 + num_neighbors
 
-        for i in range(num_nodes):
-            for j in range(num_nodes):
+        for i in range(num_agents):
+            for j in range(num_agents):
                 if i != j:
                     edge_index.append([i, j])
 
-                    # 엣지 특성 계산
-                    src_state = all_states[i]
-                    dst_state = all_states[j]
+                    src_state = all_agent_states[i]
+                    dst_state = all_agent_states[j]
 
-                    delta_q = dst_state.position - src_state.position  # 2
-                    delta_v = dst_state.velocity - src_state.velocity  # 2
-                    r = np.linalg.norm(delta_q)  # 1
-                    q_hat = delta_q / (r + 1e-6)  # 2 (단위 방향 벡터)
+                    delta_q = dst_state.position - src_state.position
+                    delta_v = dst_state.velocity - src_state.velocity
+                    r = np.linalg.norm(delta_q)
+                    q_hat = delta_q / (r + 1e-6)
 
                     edge_feat = np.concatenate([delta_q, delta_v, [r], q_hat])
                     edge_attr.append(edge_feat)
 
+        # 에이전트 → 장애물 엣지 (자기 노드에서만)
+        for obs_idx, obs_pos in enumerate(obstacles):
+            obs_node_idx = num_agents + obs_idx
+            # Ego (자기 노드) → Obstacle
+            edge_index.append([0, obs_node_idx])
+
+            delta_q = obs_pos - state.position
+            delta_v = np.zeros(2) - state.velocity  # 장애물 속도 = 0
+            r = np.linalg.norm(delta_q)
+            q_hat = delta_q / (r + 1e-6)
+
+            edge_feat = np.concatenate([delta_q, delta_v, [r], q_hat])
+            edge_attr.append(edge_feat)
+
         edge_index = torch.tensor(edge_index, dtype=torch.long).T  # (2, E)
         edge_attr = torch.tensor(np.array(edge_attr), dtype=torch.float32)  # (E, 7)
 
-        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+        # 메타 정보 저장 (나중에 사용)
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
+        data.num_obstacles = num_obstacles
+        data.num_neighbors = num_neighbors
+
+        return data
 
     def _compute_hamiltonian_gradient(
         self,
@@ -218,7 +284,9 @@ class LightPHController(BaseController):
         goal: np.ndarray,
         neighbors: List['AgentState'],
         k: np.ndarray,
-        k_g: float
+        k_g: float,
+        obstacle_positions: List[np.ndarray] = None,
+        k_io: np.ndarray = None
     ) -> np.ndarray:
         """
         Analytic Hamiltonian gradient 계산 (논문 eq.9).
@@ -229,6 +297,8 @@ class LightPHController(BaseController):
             neighbors: 이웃들
             k: 에이전트 간 스프링 상수 (len = num_neighbors)
             k_g: 목표 스프링 상수
+            obstacle_positions: 장애물 위치들 (벽 포함)
+            k_io: 장애물 상호작용 스프링 상수 (len = num_obstacles)
 
         Returns:
             [∂H/∂q_x, ∂H/∂q_y, ∂H/∂v_x, ∂H/∂v_y]
@@ -237,18 +307,48 @@ class LightPHController(BaseController):
         v = state.velocity
         m = self.robot_config.mass
 
-        # ∂H/∂q = k_g(q - g) - Σ_j k_ij(q_i - q_j)
-        # 목표: 인력 (q - goal 방향으로 끌림)
-        # 이웃: 척력 (q - neighbor 반대 방향으로 밀림)
-        dH_dq = k_g * (q - goal)
+        # Goal: 상수 크기 (거리와 무관하게 일정한 인력)
+        # Neighbor/Obstacle: k/r 스케일 (가까울수록 강한 척력)
+        goal_diff = q - goal
+        r_goal = np.linalg.norm(goal_diff) + 1e-6
+        goal_direction = goal_diff / r_goal
+        dH_dq = k_g * goal_direction  # 상수 크기: k_g
 
-        for j, neighbor in enumerate(neighbors):
-            if j < len(k):
-                k_ij = k[j]
-            else:
-                k_ij = 1.0  # 기본값
-            # 척력: 마이너스로 변경 (이웃에서 멀어지는 방향)
-            dH_dq -= k_ij * (q - neighbor.position)
+        # 이웃 척력 (Top-k: k_ij가 높은 상위 N개만 고려)
+        top_k_neighbors = 2  # 상위 2개 이웃만
+        if len(neighbors) > 0:
+            # 각 이웃의 (k_ij, force) 계산
+            neighbor_forces = []
+            for j, neighbor in enumerate(neighbors):
+                if j < len(k):
+                    k_ij = k[j]
+                else:
+                    k_ij = 1.0
+                diff = q - neighbor.position
+                r = np.linalg.norm(diff) + 1e-6
+                force = k_ij * diff / (r * r)  # k_ij/r
+                neighbor_forces.append((k_ij, force))
+
+            # k_ij 기준 내림차순 정렬 후 상위 N개 선택
+            neighbor_forces.sort(key=lambda x: x[0], reverse=True)
+            top_k = min(top_k_neighbors, len(neighbor_forces))
+
+            # 상위 N개 힘 합산 후 N으로 나눔
+            neighbor_sum = np.zeros(2)
+            for i in range(top_k):
+                neighbor_sum += neighbor_forces[i][1]
+            dH_dq -= neighbor_sum / top_k
+
+        # 장애물 척력
+        if obstacle_positions is not None and k_io is not None:
+            for o, obs_pos in enumerate(obstacle_positions):
+                if o < len(k_io):
+                    k_io_val = k_io[o]
+                else:
+                    k_io_val = 1.0
+                diff = q - obs_pos
+                r = np.linalg.norm(diff) + 1e-6
+                dH_dq -= k_io_val * diff / (r * r)  # k_io/r
 
         # ∂H/∂v = mv
         dH_dv = m * v
@@ -290,6 +390,33 @@ class LightPHController(BaseController):
 
         return J, R
 
+    def _get_wall_positions(self, agent_pos: np.ndarray) -> List[np.ndarray]:
+        """
+        각 벽에서 에이전트에 가장 가까운 점 계산.
+
+        Args:
+            agent_pos: 에이전트 위치 [x, y]
+
+        Returns:
+            4개 벽의 가장 가까운 점 리스트
+            [left_wall, right_wall, bottom_wall, top_wall]
+        """
+        if self.env_config is None:
+            return []
+
+        x, y = agent_pos
+        w, h = self.env_config.width, self.env_config.height
+
+        # 각 벽에서 가장 가까운 점
+        wall_positions = [
+            np.array([0.0, np.clip(y, 0, h)]),      # Left wall
+            np.array([w, np.clip(y, 0, h)]),        # Right wall
+            np.array([np.clip(x, 0, w), 0.0]),      # Bottom wall
+            np.array([np.clip(x, 0, w), h]),        # Top wall
+        ]
+
+        return wall_positions
+
     def forward_differentiable(
         self,
         states_batch: List[dict],
@@ -300,6 +427,9 @@ class LightPHController(BaseController):
 
         Args:
             states_batch: 배치된 상태 딕셔너리 리스트
+                - 'states': 에이전트 상태들
+                - 'goals': 목표 위치들
+                - 'obstacles': (선택) 장애물 위치들 [(x, y), ...]
             num_agents: 에이전트 수
 
         Returns:
@@ -316,23 +446,43 @@ class LightPHController(BaseController):
         all_v = []
         all_g = []
         all_neighbor_q = []
+        all_obstacle_q = []  # 장애물 위치들
+        has_obstacles = False
 
         for state_dict in states_batch:
             agent_states = state_dict['states']
             goals = state_dict['goals']
+
+            # 장애물 수집 (벽 + 외부 장애물)
+            obstacles = []
+            if self.use_walls:
+                # 각 에이전트별 벽 위치는 에이전트 위치에 따라 다름
+                pass  # 아래에서 에이전트별로 계산
+            if 'obstacles' in state_dict and state_dict['obstacles'] is not None:
+                obstacles.extend([np.asarray(o) for o in state_dict['obstacles']])
+                has_obstacles = True
 
             for i in range(num_agents):
                 state = agent_states[i]
                 goal = goals[i]
                 neighbors = [agent_states[j] for j in range(num_agents) if j != i]
 
-                graph_data = self._build_graph(state, goal, neighbors)
+                # 에이전트별 장애물 (벽 + 공통 장애물)
+                agent_obstacles = []
+                if self.use_walls:
+                    wall_pos = self._get_wall_positions(state.position)
+                    agent_obstacles.extend(wall_pos)
+                    has_obstacles = True
+                agent_obstacles.extend(obstacles)
+
+                graph_data = self._build_graph(state, goal, neighbors, agent_obstacles)
                 all_graphs.append(graph_data)
 
                 all_q.append(state.position)
                 all_v.append(state.velocity)
                 all_g.append(goal)
                 all_neighbor_q.append([n.position for n in neighbors])
+                all_obstacle_q.append([o for o in agent_obstacles])
 
         # 텐서 변환
         q_tensor = torch.tensor(np.array(all_q), dtype=torch.float32, device=device)
@@ -340,6 +490,12 @@ class LightPHController(BaseController):
         g_tensor = torch.tensor(np.array(all_g), dtype=torch.float32, device=device)
         neighbor_q_tensor = torch.tensor(np.array(all_neighbor_q), dtype=torch.float32, device=device)
         m = self.robot_config.mass
+
+        # 장애물 수 (모두 동일하다고 가정)
+        num_obstacles = len(all_obstacle_q[0]) if all_obstacle_q and len(all_obstacle_q[0]) > 0 else 0
+
+        if num_obstacles > 0:
+            obstacle_q_tensor = torch.tensor(np.array(all_obstacle_q), dtype=torch.float32, device=device)
 
         # ========== 2. PyG Batch 및 GAT ==========
         batched_graph = Batch.from_data_list(all_graphs).to(device)
@@ -356,7 +512,7 @@ class LightPHController(BaseController):
         ego_indices = batched_graph.ptr[:-1]
         k_g_ego = all_k_g[ego_indices].view(-1, 1)
 
-        # ========== 4. Edge head (Ego->Neighbor만) ==========
+        # ========== 4. Edge head (Ego에서 나가는 모든 엣지) ==========
         src, dst = batched_graph.edge_index
 
         is_ego = torch.zeros(all_node_embeddings.size(0), dtype=torch.bool, device=device)
@@ -367,25 +523,57 @@ class LightPHController(BaseController):
         ego_dst = dst[ego_edge_mask]
         ego_edge_attr = batched_graph.edge_attr[ego_edge_mask]
 
-        k_ij_all, d_ij_all, c_ij_all = self.edge_head(
+        k_all, d_all, c_all = self.edge_head(
             all_node_embeddings[ego_src],
             all_node_embeddings[ego_dst],
             ego_edge_attr
         )
 
-        # ========== 5. Vectorized Interaction Force ==========
-        k_ij_matrix = k_ij_all.view(total_graphs, num_neighbors)
-        q_diff = q_tensor.unsqueeze(1) - neighbor_q_tensor
-        weighted_diff = k_ij_matrix.unsqueeze(-1) * q_diff
-        interaction_sum = weighted_diff.sum(dim=1)
+        # 엣지 분리: neighbors (num_neighbors) + obstacles (num_obstacles)
+        num_ego_edges = num_neighbors + num_obstacles
+        k_all_matrix = k_all.view(total_graphs, num_ego_edges)
+        d_all_matrix = d_all.view(total_graphs, num_ego_edges)
+        c_all_matrix = c_all.view(total_graphs, num_ego_edges)
+
+        k_ij_matrix = k_all_matrix[:, :num_neighbors]
+        d_ij_matrix = d_all_matrix[:, :num_neighbors]
+        c_ij_matrix = c_all_matrix[:, :num_neighbors]
+
+        # ========== 5. Vectorized Interaction Force (Neighbors, Top-k) ==========
+        top_k_neighbors = 2  # 상위 2개 이웃만 고려
+        q_diff = q_tensor.unsqueeze(1) - neighbor_q_tensor  # (B*N, num_neighbors, 2)
+        r_neighbor = torch.norm(q_diff, dim=-1, keepdim=True) + 1e-6  # (B*N, num_neighbors, 1)
+        # k/r 스케일: diff / r^2 = direction / r
+        weighted_diff = k_ij_matrix.unsqueeze(-1) * q_diff / (r_neighbor * r_neighbor)  # (B*N, num_neighbors, 2)
+
+        # Top-k: k_ij가 높은 상위 N개만 선택
+        actual_k = min(top_k_neighbors, num_neighbors)
+        _, top_indices = torch.topk(k_ij_matrix, actual_k, dim=1)  # (B*N, actual_k)
+
+        # 상위 k개 힘만 선택하여 합산
+        batch_indices = torch.arange(total_graphs, device=device).unsqueeze(1).expand(-1, actual_k)
+        top_weighted_diff = weighted_diff[batch_indices, top_indices]  # (B*N, actual_k, 2)
+        interaction_sum = top_weighted_diff.sum(dim=1) / actual_k  # N으로 나눔
+
+        # ========== 5b. Obstacle Interaction Force ==========
+        if num_obstacles > 0:
+            k_io_matrix = k_all_matrix[:, num_neighbors:num_neighbors + num_obstacles]
+            obs_q_diff = q_tensor.unsqueeze(1) - obstacle_q_tensor  # (B*N, num_obstacles, 2)
+            r_obs = torch.norm(obs_q_diff, dim=-1, keepdim=True) + 1e-6  # (B*N, num_obstacles, 1)
+            obs_weighted_diff = k_io_matrix.unsqueeze(-1) * obs_q_diff / (r_obs * r_obs)
+            obstacle_sum = obs_weighted_diff.sum(dim=1)
+            interaction_sum = interaction_sum + obstacle_sum
 
         # ========== 6. Hamiltonian Gradient ==========
-        dH_dq = k_g_ego * (q_tensor - g_tensor) - interaction_sum
+        # Goal: 상수 크기 (거리와 무관하게 일정한 인력)
+        goal_diff = q_tensor - g_tensor  # (B*N, 2)
+        r_goal = torch.norm(goal_diff, dim=-1, keepdim=True) + 1e-6  # (B*N, 1)
+        goal_direction = goal_diff / r_goal  # (B*N, 2)
+        goal_term = k_g_ego * goal_direction  # 상수 크기: k_g
+        dH_dq = goal_term - interaction_sum
         dH_dv = m * v_tensor
 
         # ========== 7. Vectorized d_avg, c_avg ==========
-        d_ij_matrix = d_ij_all.view(total_graphs, num_neighbors)
-        c_ij_matrix = c_ij_all.view(total_graphs, num_neighbors)
         d_avg = d_ij_matrix.mean(dim=1)
         c_avg = c_ij_matrix.mean(dim=1)
 

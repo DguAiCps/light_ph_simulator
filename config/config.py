@@ -38,7 +38,21 @@ class EnvConfig:
 
 @dataclass
 class GATConfig:
-    """GAT 네트워크 설정 데이터 클래스."""
+    """GAT 네트워크 설정 데이터 클래스.
+노드 feature = [type(3), state(4), mission(3), goal_offset(2)] = 12
+
+- type (3):        [is_self, is_neighbor, is_obstacle] - one-hot
+- state (4):       [x, y, vx, vy] - 위치 + 속도
+- mission (3):     [arrived, in_progress, not_started] - one-hot
+- goal_offset (2): [dx, dy] - 목표까지 상대 위치
+
+엣지 feature = [Δq(2), Δv(2), r(1), q̂(2)] = 7
+
+- Δq (2): 상대 위치 [dx, dy]
+- Δv (2): 상대 속도 [dvx, dvy]  
+- r (1):  거리 (스칼라)
+- q̂ (2): 단위 방향 벡터 [x̂, ŷ]
+    """
 
     node_input_dim: int = 12  # 노드 feature 차원
     edge_input_dim: int = 7  # 엣지 feature 차원

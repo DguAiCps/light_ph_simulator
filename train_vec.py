@@ -36,6 +36,7 @@ def main():
     parser.add_argument('--checkpoint_interval', type=int, default=10000, help='체크포인트 저장 주기 (스텝)')
     parser.add_argument('--resume', type=str, default=None, help='이어서 학습할 체크포인트')
     parser.add_argument('--device', type=str, default='cuda', help='디바이스')
+    parser.add_argument('--use_walls', action='store_true', help='벽을 장애물로 그래프에 포함')
     args = parser.parse_args()
 
     # CUDA 사용 가능 여부 확인
@@ -67,6 +68,7 @@ def main():
     print(f"Total Steps: {args.total_steps}")
     print(f"Buffer Size: {args.buffer_size}")
     print(f"Batch Size: {args.batch_size}")
+    print(f"Use Walls: {args.use_walls}")
     print(f"Checkpoint: every {args.checkpoint_interval} steps")
     print("=====================================")
 
@@ -90,7 +92,8 @@ def main():
         node_head=node_head,
         edge_head=edge_head,
         robot_config=robot_config,
-        device=device
+        device=device,
+        env_config=env_config if args.use_walls else None
     )
 
     # Centralized Critic

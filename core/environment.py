@@ -436,8 +436,8 @@ class MultiAgentEnv:
 
     def _compute_reward(self, agent_idx: int, collisions: List[Tuple[int, int]]) -> float:
         """
-        단일 에이전트의 보상 계산 (논문 eq.15 기반).
-
+        단일 에이전트의 보상 계산.
+        r_t = η₁ Δμᵢ - η₂ Σⱼ 𝟙[rᵢⱼ < r_safe] + η₃ 𝟙[μᵢ = 1]
         Args:
             agent_idx: 에이전트 인덱스
             collisions: 충돌 쌍 리스트
@@ -447,8 +447,6 @@ class MultiAgentEnv:
         """
         reward = 0.0
         pos = self.states[agent_idx].position
-
-        # 현재 목표까지 거리
         current_dist = np.linalg.norm(pos - self.goals[agent_idx])
 
         # 1. 에이전트 충돌 페널티
@@ -457,22 +455,37 @@ class MultiAgentEnv:
                 reward += self.env_config.collision_penalty  # -10.0
                 break
 
-        # 2. 벽 충돌 페널티 (벽에 닿으면 페널티)
-        wall_contact_dist = self.robot_config.radius + 0.01  # 약간의 여유
+        # 1b. 근접 페널티 (충돌 전에도 가까우면 페널티)
+        proximity_threshold = 3.0 * self.robot_config.radius  # ~0.315m
+        collision_dist = 2.0 * self.robot_config.radius  # ~0.21m
+        for i in range(self.env_config.num_agents):
+            if i != agent_idx:
+                dist = np.linalg.norm(pos - self.states[i].position)
+                if dist < proximity_threshold and dist > collision_dist:
+                    # 가까울수록 페널티 증가 (최대 -0.5)
+                    proximity_ratio = 1.0 - (dist - collision_dist) / (proximity_threshold - collision_dist)
+                    reward -= 0.5 * proximity_ratio
+
+        # 2. 벽 충돌 페널티
+        wall_contact_dist = self.robot_config.radius + 0.01
         if (pos[0] < wall_contact_dist or
             pos[0] > self.env_config.width - wall_contact_dist or
             pos[1] < wall_contact_dist or
             pos[1] > self.env_config.height - wall_contact_dist):
-            reward -= 5.0  # 벽 충돌 페널티
+            reward -= 5.0
 
         # 3. 도착 보너스 (최초 도착 시 1회)
         if current_dist < self.env_config.goal_threshold and not self.arrived[agent_idx]:
             reward += self.env_config.goal_reward  # +10.0
 
-        # 4. 도착 후 이탈 페널티
+        # 4. Goal 유지 보상 (도착 후 매 스텝)
+        if current_dist < self.env_config.goal_threshold:
+            reward += 1.0  # 매 스텝 +1.0
+
+        # 5. 도착 후 이탈 페널티
         if self.arrived[agent_idx]:
             if current_dist >= self.env_config.goal_threshold:
-                reward -= 5.0  # 이탈 페널티
+                reward -= 5.0
 
         return reward
 

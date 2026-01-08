@@ -32,6 +32,7 @@ def main():
     parser.add_argument('--checkpoint_interval', type=int, default=100, help='체크포인트 저장 주기 (에피소드)')
     parser.add_argument('--resume', type=str, default=None, help='이어서 학습할 체크포인트')
     parser.add_argument('--device', type=str, default='cuda', help='디바이스')
+    parser.add_argument('--no_walls', action='store_true', help='벽을 장애물로 그래프에서 제외 (기본: 포함)')
     args = parser.parse_args()
 
     # CUDA 사용 가능 여부 확인
@@ -62,6 +63,7 @@ def main():
     print(f"Episodes: {args.num_episodes}")
     print(f"Buffer Size: {args.buffer_size}")
     print(f"Batch Size: {args.batch_size}")
+    print(f"Use Walls: {not args.no_walls}")
     print(f"Checkpoint: every {args.checkpoint_interval} episodes")
     print("=========================")
 
@@ -85,7 +87,8 @@ def main():
         node_head=node_head,
         edge_head=edge_head,
         robot_config=robot_config,
-        device=device
+        device=device,
+        env_config=env_config if not args.no_walls else None
     )
 
     # Centralized Critic
