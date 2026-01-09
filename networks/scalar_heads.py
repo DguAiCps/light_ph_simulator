@@ -95,7 +95,7 @@ class EdgeHead(nn.Module):
     """
     에이전트-에이전트 엣지 스칼라 출력: k, d, c
 
-    k: 에이전트 간 스프링 상수 [0.01, 3.0] (k/r 공식에서 필요시 강한 척력 가능)
+    k: 에이전트 간 스프링 상수 [0.01, 4.5] (k/r 공식에서 충돌 회피용 강한 척력 가능)
     d: 에이전트 간 감쇠 계수 [0.1, 5.0]
     c: 커플링 계수 [-2.0, 2.0]
     """
@@ -156,7 +156,7 @@ class EdgeHead(nn.Module):
             edge_attr: 엣지 features (E, edge_dim)
 
         Returns:
-            k: 스프링 상수 (E,), [0.1, 10.0]
+            k: 스프링 상수 (E,), [0.01, 4.5]
             d: 감쇠 계수 (E,), [0.1, 5.0]
             c: 커플링 계수 (E,), [-2.0, 2.0]
         """
@@ -164,7 +164,7 @@ class EdgeHead(nn.Module):
         combined = torch.cat([src_emb, dst_emb, edge_attr], dim=-1)
         features = self.mlp(combined)
 
-        k = bounded_activation(self.k_head(features).squeeze(-1), 0.01, 3.0)
+        k = bounded_activation(self.k_head(features).squeeze(-1), 0.01, 4.5)
         d = bounded_activation(self.d_head(features).squeeze(-1), 0.1, 5.0)
         c = bounded_activation(self.c_head(features).squeeze(-1), -2.0, 2.0)
 

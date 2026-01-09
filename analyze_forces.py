@@ -30,7 +30,7 @@ from controller import LightPHController
 AGENT_COLORS = list(mcolors.TABLEAU_COLORS.values())[:10]
 
 
-def compute_force_components(controller, state, goal, neighbors):
+def compute_force_components(controller, state, goal, neighbors, neighbor_ids=None):
     """
     각 힘 성분을 분리해서 계산.
 
@@ -118,9 +118,12 @@ def compute_force_components(controller, state, goal, neighbors):
         force = k * diff / (dist * dist)  # k/r
         force_mag = np.linalg.norm(force)
 
+        # 실제 에이전트 ID 사용 (neighbor_ids가 제공된 경우)
+        actual_id = neighbor_ids[j] if neighbor_ids is not None else j
+
         neighbor_forces.append(force)
         neighbor_details.append({
-            'neighbor_idx': j,
+            'neighbor_idx': actual_id,  # 실제 에이전트 ID
             'k_ij': k,
             'distance': dist,
             'force_mag': force_mag,
@@ -129,7 +132,11 @@ def compute_force_components(controller, state, goal, neighbors):
 
     total_neighbor_force = np.sum(neighbor_forces, axis=0) if neighbor_forces else np.zeros(2)
 
-    # 3. Obstacle (wall) repulsion forces (k/r 스케일)
+    # 3. Obstacle repulsion forces (k/r 스케일, sigmoid 활성화) - wall도 obstacle로 통합
+    # LightPHController와 동일한 상수 사용
+    OBS_THRESHOLD = 0.1  # 장애물에서 이 거리 이내에서만 반발력 작용 (m)
+    OBS_STEEPNESS = 10.0  # sigmoid 전환 급격도
+
     obstacle_forces = []
     obstacle_details = []
     for o, obs_pos in enumerate(all_obstacles):
@@ -139,7 +146,9 @@ def compute_force_components(controller, state, goal, neighbors):
             k = 1.0
         diff = q - obs_pos
         dist = np.linalg.norm(diff) + 1e-6
-        force = k * diff / (dist * dist)  # k/r
+        # sigmoid 활성화: dist < threshold일 때 ~1, dist > threshold일 때 ~0
+        activation = 1.0 / (1.0 + np.exp((dist - OBS_THRESHOLD) * OBS_STEEPNESS))
+        force = k * diff / (dist * dist) * activation  # k/r * activation
         force_mag = np.linalg.norm(force)
 
         obstacle_forces.append(force)
@@ -176,9 +185,28 @@ def compute_force_components(controller, state, goal, neighbors):
     }
 
 
-def draw_force_arrow(ax, start, force_vec, color, scale=0.5, label=None, alpha=0.8):
-    """힘 벡터 화살표 그리기."""
-    end = start + np.array(force_vec) * scale
+def draw_force_arrow(ax, start, force_vec, color, scale=0.5, label=None, alpha=0.8, max_length=1.5):
+    """힘 벡터 화살표 그리기.
+
+    Args:
+        ax: matplotlib axis
+        start: 시작점 (agent position)
+        force_vec: 힘 벡터
+        color: 화살표 색상
+        scale: 힘 스케일 (기본 0.5)
+        label: 라벨 (optional)
+        alpha: 투명도
+        max_length: 최대 화살표 길이 (미터) - 이 값을 초과하면 방향 유지하며 클리핑
+    """
+    force_vec = np.array(force_vec)
+    scaled_vec = force_vec * scale
+    vec_length = np.linalg.norm(scaled_vec)
+
+    # 최대 길이 초과시 클리핑 (방향 유지)
+    if vec_length > max_length and vec_length > 1e-6:
+        scaled_vec = scaled_vec * (max_length / vec_length)
+
+    end = start + scaled_vec
     arrow = FancyArrowPatch(start, end, mutation_scale=10,
                             arrowstyle='->', color=color, alpha=alpha, linewidth=2)
     ax.add_patch(arrow)
@@ -195,6 +223,7 @@ def main():
     parser.add_argument('--no_walls', action='store_true', help='벽을 장애물로 그래프에서 제외 (기본: 포함)')
     parser.add_argument('--show_vectors', action='store_true', help='힘 벡터 화살표 표시')
     parser.add_argument('--force_scale', type=float, default=0.1, help='힘 벡터 스케일')
+    parser.add_argument('--max_arrow_length', type=float, default=1.5, help='최대 화살표 길이 (m)')
     args = parser.parse_args()
 
     # Device
@@ -283,8 +312,9 @@ def main():
         for i in range(args.num_agents):
             state = states[i]
             goal = goals[i]
-            neighbors = [states[j] for j in range(args.num_agents) if j != i]
-            force_data = compute_force_components(controller, state, goal, neighbors)
+            neighbor_ids = [j for j in range(args.num_agents) if j != i]
+            neighbors = [states[j] for j in neighbor_ids]
+            force_data = compute_force_components(controller, state, goal, neighbors, neighbor_ids)
             all_force_data.append(force_data)
 
         # === Simulation View ===
@@ -326,17 +356,20 @@ def main():
                 if fd['goal_force_mag'] > 0.01:
                     # 실제 힘은 -goal_force 방향 (goal로 끌리는 힘)
                     draw_force_arrow(ax_sim, pos, -np.array(fd['goal_force']),
-                                    'red', scale=args.force_scale)
+                                    'red', scale=args.force_scale,
+                                    max_length=args.max_arrow_length)
 
                 # Neighbor repulsion (blue)
                 if fd['total_neighbor_force_mag'] > 0.01:
                     draw_force_arrow(ax_sim, pos, fd['total_neighbor_force'],
-                                    'blue', scale=args.force_scale)
+                                    'blue', scale=args.force_scale,
+                                    max_length=args.max_arrow_length)
 
                 # Wall repulsion (brown)
                 if fd['total_obstacle_force_mag'] > 0.01:
                     draw_force_arrow(ax_sim, pos, fd['total_obstacle_force'],
-                                    'brown', scale=args.force_scale)
+                                    'brown', scale=args.force_scale,
+                                    max_length=args.max_arrow_length)
 
         # Wall sample points (for visualization)
         if show_vectors and all_force_data[0]['wall_positions']:

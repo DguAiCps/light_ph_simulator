@@ -385,55 +385,6 @@ class MultiAgentEnv:
             if resolved:
                 break
 
-    def _compute_wall_force(self, state: AgentState) -> np.ndarray:
-        """
-        벽 근처에서 반발력 계산 (거리 기반).
-
-        벽에서 influence_dist 이내에 있으면 반발력 작용.
-
-        Args:
-            state: 에이전트 상태
-
-        Returns:
-            벽 반발력 [Fx, Fy]
-        """
-        force = np.zeros(2)
-        pos = state.position
-        vel = state.velocity
-        radius = self.robot_config.radius
-        k = self.env_config.wall_stiffness
-        b = self.env_config.wall_damping
-
-        # 반발력 영향 거리 (벽에서 이 거리 이내면 반발력 작용)
-        influence_dist = radius + 0.01
-
-        # 왼쪽 벽 (x = 0)
-        dist_to_wall = pos[0]  # 벽까지 거리
-        if dist_to_wall < influence_dist:
-            # 거리가 가까울수록 강한 반발력
-            strength = (influence_dist - dist_to_wall) / influence_dist
-            force[0] += k * strength - b * min(vel[0], 0)
-
-        # 오른쪽 벽 (x = width)
-        dist_to_wall = self.env_config.width - pos[0]
-        if dist_to_wall < influence_dist:
-            strength = (influence_dist - dist_to_wall) / influence_dist
-            force[0] -= k * strength + b * max(vel[0], 0)
-
-        # 아래쪽 벽 (y = 0)
-        dist_to_wall = pos[1]
-        if dist_to_wall < influence_dist:
-            strength = (influence_dist - dist_to_wall) / influence_dist
-            force[1] += k * strength - b * min(vel[1], 0)
-
-        # 위쪽 벽 (y = height)
-        dist_to_wall = self.env_config.height - pos[1]
-        if dist_to_wall < influence_dist:
-            strength = (influence_dist - dist_to_wall) / influence_dist
-            force[1] -= k * strength + b * max(vel[1], 0)
-
-        return force
-
     def _compute_reward(self, agent_idx: int, collisions: List[Tuple[int, int]]) -> float:
         """
         단일 에이전트의 보상 계산.

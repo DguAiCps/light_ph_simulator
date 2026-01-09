@@ -32,6 +32,10 @@ class LightPHController(BaseController):
     GAT로 이웃 정보를 처리하고 Port-Hamiltonian 제어 법칙 적용.
     """
 
+    # 장애물 반발력 활성화 파라미터 (고정값) - wall도 obstacle로 통합
+    OBS_THRESHOLD = 0.1  # 장애물에서 이 거리 이내에서만 반발력 작용 (m)
+    OBS_STEEPNESS = 10.0  # sigmoid 전환 급격도
+
     def __init__(
         self,
         gat_backbone: GATBackbone,
@@ -339,7 +343,7 @@ class LightPHController(BaseController):
                 neighbor_sum += neighbor_forces[i][1]
             dH_dq -= neighbor_sum / top_k
 
-        # 장애물 척력
+        # 장애물 척력 (sigmoid 활성화: threshold 이내에서만 작용)
         if obstacle_positions is not None and k_io is not None:
             for o, obs_pos in enumerate(obstacle_positions):
                 if o < len(k_io):
@@ -348,7 +352,9 @@ class LightPHController(BaseController):
                     k_io_val = 1.0
                 diff = q - obs_pos
                 r = np.linalg.norm(diff) + 1e-6
-                dH_dq -= k_io_val * diff / (r * r)  # k_io/r
+                # sigmoid 활성화: r < threshold일 때 ~1, r > threshold일 때 ~0
+                activation = 1.0 / (1.0 + np.exp((r - self.OBS_THRESHOLD) * self.OBS_STEEPNESS))
+                dH_dq -= k_io_val * diff / (r * r) * activation  # k_io/r * activation
 
         # ∂H/∂v = mv
         dH_dv = m * v
@@ -555,12 +561,14 @@ class LightPHController(BaseController):
         top_weighted_diff = weighted_diff[batch_indices, top_indices]  # (B*N, actual_k, 2)
         interaction_sum = top_weighted_diff.sum(dim=1) / actual_k  # N으로 나눔
 
-        # ========== 5b. Obstacle Interaction Force ==========
+        # ========== 5b. Obstacle Interaction Force (sigmoid 활성화) ==========
         if num_obstacles > 0:
             k_io_matrix = k_all_matrix[:, num_neighbors:num_neighbors + num_obstacles]
             obs_q_diff = q_tensor.unsqueeze(1) - obstacle_q_tensor  # (B*N, num_obstacles, 2)
             r_obs = torch.norm(obs_q_diff, dim=-1, keepdim=True) + 1e-6  # (B*N, num_obstacles, 1)
-            obs_weighted_diff = k_io_matrix.unsqueeze(-1) * obs_q_diff / (r_obs * r_obs)
+            # sigmoid 활성화: r < threshold일 때 ~1, r > threshold일 때 ~0
+            activation = torch.sigmoid((self.OBS_THRESHOLD - r_obs.squeeze(-1)) * self.OBS_STEEPNESS)  # (B*N, num_obstacles)
+            obs_weighted_diff = k_io_matrix.unsqueeze(-1) * obs_q_diff / (r_obs * r_obs) * activation.unsqueeze(-1)
             obstacle_sum = obs_weighted_diff.sum(dim=1)
             interaction_sum = interaction_sum + obstacle_sum
 
